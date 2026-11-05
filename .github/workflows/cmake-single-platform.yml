@@ -1,39 +1,82 @@
-# This starter workflow is for a CMake project running on a single platform. There is a different starter workflow if you need cross-platform coverage.
-# See: https://github.com/actions/starter-workflows/blob/main/ci/cmake-multi-platform.yml
-name: CMake on a single platform
+name: Build Unigram
 
 on:
   push:
-    branches: [ "develop" ]
-  pull_request:
-    branches: [ "develop" ]
-
-env:
-  # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
-  BUILD_TYPE: Release
+    branches: [ develop ]
+  workflow_dispatch: # 允许手动触发
 
 jobs:
   build:
-    # The CMake configure and build commands are platform agnostic and should work equally well on Windows or Mac.
-    # You can convert this to a matrix build if you need cross-platform coverage.
-    # See: https://docs.github.com/en/free-pro-team@latest/actions/learn-github-actions/managing-complex-workflows#using-a-build-matrix
-    runs-on: ubuntu-latest
+    # UWP 构建强烈建议使用 Windows Server 2022 或更新版本
+    runs-on: windows-2022
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout repository (recursive for submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
 
-    - name: Configure CMake
-      # Configure CMake in a 'build' subdirectory. `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
-      # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
-      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
 
-    - name: Build
-      # Build your program with the given configuration
-      run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}}
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
 
-    - name: Test
-      working-directory: ${{github.workspace}}/build
-      # Execute tests defined by the CMake configuration.
-      # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
-      run: ctest -C ${{env.BUILD_TYPE}}
+      # ⚠️ 关键：注入 Telegram API 凭证
+      # 你需要在 GitHub 仓库的 Settings -> Secrets and variables -> Actions 中
+      # 添加 TELEGRAM_API_ID 和 TELEGRAM_API_HASH 两个 Secret
+      - name: Create Constants.Secret.cs
+        shell: pwsh
+        run: |
+          $secretFile = "Unigram\Telegram\Constants.Secret.cs"
+          $content = @"
+          namespace Telegram
+          {
+              public static partial class Constants
+              {
+                  static Constants()
+                  {
+                      ApiId = ${{ secrets.TELEGRAM_API_ID }};
+                      ApiHash = "${{ secrets.TELEGRAM_API_HASH }}";
+                      AppChannel = "UnigramDev";
+                  }
+              }
+          }
+          "@
+          Set-Content -Path $secretFile -Value $content -Encoding UTF8
 
+      # ⚠️ 极其复杂的依赖处理步骤 (此处仅示意，实际极易出错)
+      # 官方要求克隆特定 commit 的 vcpkg，打补丁，并修改 ffmpeg 的 portfile
+      # 在 CI 环境中，TDLib 的编译通常需要数十分钟甚至更久，且容易因环境差异失败
+      - name: Setup vcpkg (Reference only)
+        shell: pwsh
+        run: |
+          # 注意：官方文档中 vcpkg 的 commit 和补丁步骤非常繁琐
+          # 这里仅做一个最简单的克隆示意，实际需要参照官方 Build-instructions.md 进行 checkout 和 patch
+          git clone https://github.com/Microsoft/vcpkg.git
+          cd vcpkg
+          .\bootstrap-vcpkg.bat
+          # 官方要求设置 VCPKG_ROOT 环境变量（新版流程）或运行 integrate install（旧版流程）
+          echo "VCPKG_ROOT=$PWD" >> $env:GITHUB_ENV
+
+      - name: Restore NuGet packages
+        run: nuget restore Unigram.sln
+
+      # ⚠️ 构建 UWP 项目
+      # 官方并未提供直接的 MSBuild 命令来生成 .exe，而是生成 .msix 包
+      # 这里使用通用的 MSBuild 命令尝试构建 Release 版本
+      - name: Build Solution
+        run: |
+          msbuild Unigram.sln /p:Configuration=Release /p:Platform=x64 /p:UapAppxPackageBuildMode=SideloadOnly /p:AppxBundle=Always /p:AppxPackageSigningEnabled=false
+        # 注意：如果不签名，生成的包在安装时会有问题
+
+      # 上传构建产物 (通常是 .msix 或 .msixbundle)
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Unigram-Build
+          path: |
+            **\AppPackages\**
+            **\*.msix
+            **\*.msixbundle
